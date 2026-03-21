@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+database/trading_analysis.db
+video_data/
+logs/
+backtesting/results/
+*.egg-info/
+dist/
+build/
+.DS_Store

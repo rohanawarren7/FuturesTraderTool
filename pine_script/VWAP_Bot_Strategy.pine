@@ -1,0 +1,197 @@
+//@version=5
+strategy("VWAP Bot Strategy v1.1 — Prop Firm Edition",
+         overlay=true,
+         initial_capital=50000,
+         default_qty_type=strategy.fixed,
+         default_qty_value=1,
+         commission_type=strategy.commission.cash_per_contract,
+         commission_value=0.70,
+         slippage=1,
+         margin_long=40,
+         margin_short=40,
+         max_bars_back=500)
+
+// ============================================================
+// INPUTS — OPTIMISABLE PARAMETERS
+// ============================================================
+i_sd_entry    = input.float(1.0,  "SD Band Entry Multiplier", 0.5, 2.5, 0.25)
+i_sd_stop     = input.float(1.5,  "SD Band Stop Multiplier",  1.0, 3.0, 0.25)
+i_rr          = input.float(2.0,  "Risk:Reward Ratio",        1.0, 4.0, 0.25)
+i_contracts   = input.int(1,      "Contracts",                 1,   5,   1)
+i_vol_mult    = input.float(1.8,  "Volume Spike Multiplier",  1.2, 3.0, 0.1)
+i_session_start = input.session("0945-1400", "Trade Session (ET)")
+
+// ============================================================
+// PROP FIRM CONSTRAINTS (TOPSTEP 50K — DO NOT CHANGE)
+// ============================================================
+ACCOUNT_SIZE       = 50000
+MLL                = 2000
+DAILY_STOP_PCT     = 0.40
+MAX_CONTRACTS      = 5
+PROFIT_PROTECT_USD = 400
+DAILY_STOP_USD     = MLL * DAILY_STOP_PCT  // = $800
+
+// ============================================================
+// SESSION VWAP CALCULATION
+// ============================================================
+is_new_session = ta.change(time("D")) != 0
+
+var float cum_tp_vol    = 0.0
+var float cum_vol       = 0.0
+var float cum_tp_vol_sq = 0.0
+
+tp = (high + low + close) / 3
+
+if is_new_session
+    cum_tp_vol    := tp * volume
+    cum_vol       := volume
+    cum_tp_vol_sq := (tp * tp) * volume
+else
+    cum_tp_vol    += tp * volume
+    cum_vol       += volume
+    cum_tp_vol_sq += (tp * tp) * volume
+
+vwap_val  = cum_tp_vol / cum_vol
+variance  = math.max(0, (cum_tp_vol_sq / cum_vol) - (vwap_val * vwap_val))
+vwap_std  = math.sqrt(variance)
+
+sd1_upper = vwap_val + vwap_std
+sd1_lower = vwap_val - vwap_std
+sd2_upper = vwap_val + (2 * vwap_std)
+sd2_lower = vwap_val - (2 * vwap_std)
+
+plot(vwap_val,  "VWAP",      color=color.white,               linewidth=2)
+plot(sd1_upper, "SD1 Upper", color=color.new(color.green, 50), linewidth=1)
+plot(sd1_lower, "SD1 Lower", color=color.new(color.green, 50), linewidth=1)
+plot(sd2_upper, "SD2 Upper", color=color.new(color.orange, 50))
+plot(sd2_lower, "SD2 Lower", color=color.new(color.orange, 50))
+
+// ============================================================
+// MARKET STATE DETECTION
+// ============================================================
+vol_avg   = ta.sma(volume, 20)
+vol_spike = volume > (vol_avg * i_vol_mult)
+atr_val   = ta.atr(14)
+atr_avg   = ta.sma(atr_val, 20)
+atr_ratio = atr_val / atr_avg
+
+price_above_sd1  = close > sd1_upper
+price_below_sd1  = close < sd1_lower
+price_inside_sd1 = close >= sd1_lower and close <= sd1_upper
+
+// Delta proxy — close vs open (approximation; replace with real delta in Sierra Chart phase)
+// NOTE: This is a bullish/bearish candle proxy, not true order flow cumulative delta.
+delta_positive  = close > open
+delta_negative  = close < open
+delta_flip_up   = delta_positive and not delta_positive[1]
+delta_flip_down = delta_negative and not delta_negative[1]
+
+is_balanced = price_inside_sd1 and atr_ratio < 1.5
+
+// ============================================================
+// PROP FIRM DAILY TRACKING (Bug 6 fix)
+// Bug in original: strategy.netprofit[ta.barssince(is_new_session)] uses
+// a dynamic historical index which fails at runtime in Pine v5.
+// Fix: capture strategy.netprofit at session open into a var, hold it.
+// ============================================================
+var float session_start_netprofit = 0.0
+var bool  day_stopped             = false
+
+if is_new_session
+    session_start_netprofit := strategy.netprofit
+    day_stopped             := false
+
+daily_pnl = strategy.openprofit + (strategy.netprofit - session_start_netprofit)
+
+if daily_pnl <= -DAILY_STOP_USD
+    day_stopped := true
+
+profit_protect_active = daily_pnl >= PROFIT_PROTECT_USD
+
+// ============================================================
+// SESSION TIME FILTER
+// ============================================================
+in_session   = not na(time(timeframe.period, i_session_start))
+not_new_open = ta.barssince(is_new_session) > 3
+
+trade_allowed = in_session and not_new_open and not day_stopped and
+                strategy.opentrades == 0
+
+// ============================================================
+// ENTRY SIGNALS
+// ============================================================
+// SETUP 1: MEAN REVERSION — BALANCED MARKET
+long_mr  = trade_allowed and is_balanced and price_below_sd1 and
+           delta_flip_up and vol_spike
+
+short_mr = trade_allowed and is_balanced and price_above_sd1 and
+           delta_flip_down and vol_spike
+
+// SETUP 2: SD2 EXTREME FADE
+long_sd2  = trade_allowed and close < sd2_lower and vol_spike and delta_flip_up
+short_sd2 = trade_allowed and close > sd2_upper and vol_spike and delta_flip_down
+
+entry_long  = long_mr or long_sd2
+entry_short = short_mr or short_sd2
+
+// ============================================================
+// CONTRACT SIZING (Bug 3 fix)
+// Original: webhook hardcoded "quantity":1 regardless of this calculation.
+// Fix: contracts_to_use is now referenced in the alert message via
+// strategy.order.contracts placeholder. The alert JSON uses the actual
+// filled quantity from the strategy engine, not a hardcoded literal.
+// ============================================================
+contracts_to_use = profit_protect_active ?
+                   math.max(1, math.floor(i_contracts / 2)) :
+                   math.min(i_contracts, MAX_CONTRACTS)
+
+// ============================================================
+// STOP LOSS & TARGET
+// ============================================================
+stop_dist   = vwap_std * i_sd_stop
+target_dist = stop_dist * i_rr
+
+// ============================================================
+// EXECUTE ORDERS
+// ============================================================
+if entry_long
+    strategy.entry("Long", strategy.long, qty=contracts_to_use)
+    strategy.exit("Long Exit", "Long",
+                  stop    = close - stop_dist,
+                  limit   = close + target_dist,
+                  comment = "SL/TP")
+
+if entry_short
+    strategy.entry("Short", strategy.short, qty=contracts_to_use)
+    strategy.exit("Short Exit", "Short",
+                  stop    = close + stop_dist,
+                  limit   = close - target_dist,
+                  comment = "SL/TP")
+
+// ============================================================
+// WEBHOOK ALERTS (Bug 3 fix)
+// Original spec hardcoded "quantity":1 in both alertcondition payloads.
+// Fix: use {{strategy.order.contracts}} so TradersPost receives the actual
+// contracts_to_use value (1 normally, halved during profit-protect mode).
+// ============================================================
+alertcondition(entry_long,
+    "VWAP Long Entry",
+    '{"ticker":"{{ticker}}","action":"buy","orderType":"market","quantity":{{strategy.order.contracts}},"price":"{{close}}","timestamp":"{{timenow}}","setup":"mean_reversion"}')
+
+alertcondition(entry_short,
+    "VWAP Short Entry",
+    '{"ticker":"{{ticker}}","action":"sell","orderType":"market","quantity":{{strategy.order.contracts}},"price":"{{close}}","timestamp":"{{timenow}}","setup":"mean_reversion"}')
+
+// ============================================================
+// DASHBOARD LABELS (on-chart status)
+// ============================================================
+if barstate.islast
+    label.new(bar_index, high,
+              text  = "VWAP: " + str.tostring(vwap_val, "#.##") +
+                      "\nDaily PnL: $" + str.tostring(math.round(daily_pnl)) +
+                      "\nStop budget: $" + str.tostring(DAILY_STOP_USD) +
+                      "\nDay stopped: " + str.tostring(day_stopped),
+              style = label.style_label_left,
+              color = day_stopped ? color.red : color.new(color.blue, 70),
+              textcolor = color.white,
+              size  = size.small)
