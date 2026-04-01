@@ -2,14 +2,14 @@
 """
 Video Analysis Pipeline Runner
 Scans the downloads directory and processes each video through the full
-AI pipeline (Whisper → Gemini entry + outcome) to populate raw_video_trades.
+AI pipeline (YouTube captions / faster-whisper → Gemini entry + outcome).
 
 Usage (from WSL2):
-    # Basic run (2 workers)
-    nohup python scripts/run_video_pipeline.py > logs/pipeline.log 2>&1 &
+    # Basic run
+    python scripts/run_video_pipeline.py
 
-    # Custom workers and Whisper model
-    python scripts/run_video_pipeline.py --workers 2 --whisper-model large
+    # Custom workers and fallback Whisper model size
+    python scripts/run_video_pipeline.py --workers 2 --whisper-model small
 
     # Resume from a specific video ID
     python scripts/run_video_pipeline.py --start-from <video_id>

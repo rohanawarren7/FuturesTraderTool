@@ -1,0 +1,22 @@
+{
+    "result": {
+        "MES.c.0": [
+            {
+                "d0": "2023-09-05",
+                "d1": "2023-09-06",
+                "s": "2922"
+            }
+        ]
+    },
+    "symbols": [
+        "MES.c.0"
+    ],
+    "stype_in": "continuous",
+    "stype_out": "instrument_id",
+    "start_date": "2023-09-05",
+    "end_date": "2023-09-06",
+    "partial": [],
+    "not_found": [],
+    "message": "OK",
+    "status": 0
+}

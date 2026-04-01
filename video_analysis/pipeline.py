@@ -4,13 +4,12 @@ Processes YouTube trading session recordings to extract codifiable trade rules.
 
 Pipeline per video:
   1. Download video (yt-dlp)
-  2. Extract audio (FFmpeg → 16kHz mono MP3)
-  3. Transcribe audio (Whisper medium)
-  4. Detect trade events from transcript (keyword cluster matching)
-  5. Extract video frames at event timestamps (FFmpeg)
-  6. Analyse each frame with Gemini Vision — entry pass (Setup 1)
-  7. Analyse post-entry frames with Gemini Vision — outcome pass (Setup 2)
-  8. Fuse audio + visual results → write to raw_video_trades table
+  2. Get transcript — YouTube captions first (~5s), faster-whisper fallback (~5min)
+  3. Detect trade events from transcript (keyword cluster matching)
+  4. Extract video frames at event timestamps (FFmpeg)
+  5. Analyse each frame with Gemini Vision — entry pass
+  6. Analyse post-entry frames with Gemini Vision — outcome pass
+  7. Fuse audio + visual results → write to raw_video_trades table
 """
 
 import subprocess
@@ -23,7 +22,7 @@ import sqlite3
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import whisper
+import time
 from google import genai
 from google.genai import types
 import PIL.Image
@@ -113,11 +112,11 @@ class TradingVideoPipeline:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.gemini_client = genai.Client(api_key=gemini_api_key)
-        self.gemini_model_name = "gemini-2.0-flash"
+        self.gemini_model_name = "gemini-2.5-flash"
 
-        print(f"[Pipeline] Loading Whisper {whisper_model_size} model...")
-        self.whisper_model = whisper.load_model(whisper_model_size)
-        print("[Pipeline] Whisper ready.")
+        self.whisper_model_size = whisper_model_size
+        self._whisper_model = None   # lazy-load only if captions unavailable
+        print("[Pipeline] Ready (Whisper lazy-loaded on first cache miss).")
 
     # ------------------------------------------------------------------
     # Step 1: Download
@@ -143,42 +142,83 @@ class TradingVideoPipeline:
         return output_path
 
     # ------------------------------------------------------------------
-    # Step 2: Extract audio
+    # Step 2: Get transcript (YouTube captions → faster-whisper fallback)
     # ------------------------------------------------------------------
 
-    def extract_audio(self, video_path: Path) -> Path:
-        audio_path = self.output_dir / "audio" / f"{video_path.stem}_audio.mp3"
-        audio_path.parent.mkdir(parents=True, exist_ok=True)
+    def get_transcript(self, video_id: str, video_path: Path) -> dict:
+        """
+        Returns a transcript dict with a 'segments' list of
+        {'start': float, 'end': float, 'text': str}.
 
-        if audio_path.exists():
-            return audio_path
-
-        cmd = [
-            "ffmpeg", "-i", str(video_path),
-            "-ac", "1", "-ar", "16000",
-            "-y", str(audio_path),
-        ]
-        subprocess.run(cmd, check=True, capture_output=True)
-        return audio_path
-
-    # ------------------------------------------------------------------
-    # Step 3: Transcribe
-    # ------------------------------------------------------------------
-
-    def transcribe_audio(self, audio_path: Path) -> dict:
-        transcript_path = self.output_dir / "transcripts" / f"{audio_path.stem}.json"
+        Priority:
+          1. Cached JSON on disk
+          2. YouTube auto-captions (instant)
+          3. faster-whisper local transcription (fallback)
+        """
+        transcript_path = self.output_dir / "transcripts" / f"{video_id}.json"
         transcript_path.parent.mkdir(parents=True, exist_ok=True)
 
         if transcript_path.exists():
             return json.loads(transcript_path.read_text())
 
-        result = self.whisper_model.transcribe(
-            str(audio_path),
-            word_timestamps=True,
-            language="en",
+        # -- Try YouTube captions first --
+        transcript = self._fetch_youtube_captions(video_id)
+        if transcript:
+            transcript_path.write_text(json.dumps(transcript, indent=2))
+            return transcript
+
+        # -- Fallback: faster-whisper --
+        print(f"[Pipeline] No captions for {video_id} — running faster-whisper...")
+        transcript = self._transcribe_faster_whisper(video_path)
+        transcript_path.write_text(json.dumps(transcript, indent=2))
+        return transcript
+
+    def _fetch_youtube_captions(self, video_id: str) -> dict | None:
+        """Download YouTube auto-captions. Returns None if unavailable."""
+        try:
+            from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
+            raw = YouTubeTranscriptApi.get_transcript(video_id, languages=["en", "en-US"])
+            segments = [
+                {"start": e["start"], "end": e["start"] + e["duration"], "text": e["text"]}
+                for e in raw
+            ]
+            print(f"[Pipeline] YouTube captions fetched ({len(segments)} segments)")
+            return {"segments": segments, "source": "youtube_captions"}
+        except Exception as e:
+            print(f"[Pipeline] YouTube captions unavailable: {e}")
+            return None
+
+    def _transcribe_faster_whisper(self, video_path: Path) -> dict:
+        """Transcribe with faster-whisper (4× faster than openai-whisper on CPU)."""
+        if self._whisper_model is None:
+            from faster_whisper import WhisperModel
+            print(f"[Pipeline] Loading faster-whisper {self.whisper_model_size}...")
+            self._whisper_model = WhisperModel(
+                self.whisper_model_size,
+                device="cpu",
+                compute_type="int8",   # int8 quantisation — fastest on CPU
+            )
+            print("[Pipeline] faster-whisper ready.")
+
+        # Extract audio first
+        audio_path = self.output_dir / "audio" / f"{video_path.stem}_audio.mp3"
+        audio_path.parent.mkdir(parents=True, exist_ok=True)
+        if not audio_path.exists():
+            subprocess.run(
+                ["ffmpeg", "-i", str(video_path), "-ac", "1", "-ar", "16000",
+                 "-y", str(audio_path)],
+                check=True, capture_output=True,
+            )
+
+        segments_iter, _ = self._whisper_model.transcribe(
+            str(audio_path), language="en", beam_size=1, vad_filter=True,
         )
-        transcript_path.write_text(json.dumps(result, indent=2))
-        return result
+        segments = [
+            {"start": s.start, "end": s.end, "text": s.text}
+            for s in segments_iter
+        ]
+        print(f"[Pipeline] faster-whisper done ({len(segments)} segments)")
+        return {"segments": segments, "source": "faster_whisper"}
 
     # ------------------------------------------------------------------
     # Step 4: Detect trade events from transcript
@@ -240,17 +280,32 @@ class TradingVideoPipeline:
     # Step 6: Gemini entry analysis
     # ------------------------------------------------------------------
 
+    def _gemini_call(self, contents: list, retries: int = 5) -> str:
+        """Calls Gemini with exponential backoff on quota/rate errors."""
+        for attempt in range(retries):
+            try:
+                response = self.gemini_client.models.generate_content(
+                    model=self.gemini_model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json"
+                    ),
+                )
+                return response.text
+            except Exception as e:
+                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                    wait = 60 * (2 ** attempt)  # 60, 120, 240, 480, 960s
+                    print(f"[Pipeline] Gemini quota hit — waiting {wait}s (attempt {attempt+1}/{retries})")
+                    time.sleep(wait)
+                else:
+                    raise
+        return ""
+
     def analyse_entry_frame(self, frame_path: Path) -> dict:
         img = PIL.Image.open(frame_path)
-        response = self.gemini_client.models.generate_content(
-            model=self.gemini_model_name,
-            contents=[GEMINI_ENTRY_PROMPT, img],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
-            ),
-        )
+        text = self._gemini_call([GEMINI_ENTRY_PROMPT, img])
         try:
-            return json.loads(response.text)
+            return json.loads(text)
         except (json.JSONDecodeError, ValueError):
             return {"trade_detected": False, "confidence": 0.0,
                     "notes": "Gemini parse error (entry)"}
@@ -307,15 +362,9 @@ class TradingVideoPipeline:
             transcript_excerpt=excerpt,
         )
 
-        response = self.gemini_client.models.generate_content(
-            model=self.gemini_model_name,
-            contents=[prompt] + frame_images,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
-            ),
-        )
+        text = self._gemini_call([prompt] + frame_images)
         try:
-            return json.loads(response.text)
+            return json.loads(text)
         except (json.JSONDecodeError, ValueError):
             return {
                 "outcome": "UNKNOWN",
@@ -391,8 +440,7 @@ class TradingVideoPipeline:
             print(f"[Pipeline] Using pre-downloaded file: {video_path}")
         else:
             video_path = self.download_video(youtube_url, video_id)
-        audio_path = self.extract_audio(video_path)
-        transcript = self.transcribe_audio(audio_path)
+        transcript = self.get_transcript(video_id, video_path)
         events = self.detect_trade_events(transcript)
         print(f"[Pipeline] {len(events)} audio trade events detected")
 

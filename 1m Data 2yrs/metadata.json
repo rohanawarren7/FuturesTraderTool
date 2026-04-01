@@ -1,0 +1,28 @@
+{
+    "version": 1,
+    "job_id": "GLBX-20260401-QY85T9GYFT",
+    "query": {
+        "dataset": "GLBX.MDP3",
+        "schema": "ohlcv-1m",
+        "symbols": [
+            "MES.c.0"
+        ],
+        "stype_in": "continuous",
+        "stype_out": "instrument_id",
+        "start": 1672531200000000000,
+        "end": 1735689600000000000,
+        "limit": null,
+        "encoding": "csv",
+        "compression": null
+    },
+    "customizations": {
+        "pretty_px": false,
+        "pretty_ts": false,
+        "map_symbols": false,
+        "split_symbols": false,
+        "split_duration": "day",
+        "split_size": null,
+        "packaging": null,
+        "delivery": "download"
+    }
+}

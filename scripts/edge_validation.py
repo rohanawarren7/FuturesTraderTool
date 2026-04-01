@@ -17,6 +17,7 @@ Exit codes:
 
 import argparse
 import sys
+import math
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -25,8 +26,23 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
-from scipy import stats
 from database.db_manager import DBManager
+
+
+def _binomtest_pvalue(k: int, n: int, p: float) -> float:
+    """One-tailed binomial test p-value P(X >= k | Binom(n, p)). No scipy needed."""
+    if n == 0:
+        return 1.0
+    if n >= 30:
+        # Normal approximation with continuity correction
+        mu = n * p
+        sigma = math.sqrt(n * p * (1 - p))
+        z = (k - 0.5 - mu) / sigma
+        return 0.5 * math.erfc(z / math.sqrt(2))
+    return sum(
+        math.comb(n, i) * (p ** i) * ((1 - p) ** (n - i))
+        for i in range(k, n + 1)
+    )
 
 
 # ────────────────────────────────────────────────────────────
@@ -73,8 +89,7 @@ def run_validation(db_path: str, min_confidence: float, min_trades: int) -> dict
 
     # ── Binomial test (one-tailed: win_rate > null) ────────
     # Null H0: p(win) = 0.50  |  Alt H1: p(win) > 0.50
-    p_value = stats.binomtest(n_wins, n=n_total, p=NULL_WIN_RATE,
-                               alternative="greater").pvalue
+    p_value = _binomtest_pvalue(n_wins, n=n_total, p=NULL_WIN_RATE)
     result["p_value"] = p_value
 
     if p_value >= ALPHA:

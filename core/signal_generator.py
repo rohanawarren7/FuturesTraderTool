@@ -1,3 +1,5 @@
+import pandas as pd
+
 # Hard stop-trading conditions — ALL must pass before any signal is evaluated.
 # These are circuit breakers, not tunable parameters. Do not relax without data.
 HARD_FILTERS = {
@@ -49,6 +51,7 @@ class SignalGenerator:
         volume_spike: bool,         # Volume > threshold × average
         session_phase: str,         # "OPEN", "MID", "CLOSE"
         time_in_session_minutes: int,
+        timestamp=None,            # Optional: timestamp for time-of-day filtering
     ) -> dict:
         """Returns a signal dict with action, setup_type, confidence, and notes."""
 
@@ -58,6 +61,19 @@ class SignalGenerator:
         if time_in_session_minutes < 15 or time_in_session_minutes > 375:
             hold["notes"] = "TIME_FILTER: Outside preferred trading window"
             return hold
+        
+        # Filter: No trades during Globex open (18:00-19:30 ET) - backtest showed losses
+        if timestamp is not None:
+            from datetime import datetime
+            if isinstance(timestamp, str):
+                timestamp = pd.to_datetime(timestamp)
+            hour = timestamp.hour
+            minute = timestamp.minute
+            # Block 18:00-19:30 (hour 18, or hour 19 with minute < 30)
+            # Backtest showed this is the optimal cutoff - beyond 19:30 filters out winners
+            if hour == 18 or (hour == 19 and minute < 30):
+                hold["notes"] = "TIME_FILTER: Avoiding Globex open (18:00-19:30)"
+                return hold
 
         if market_state == "LOW_ACTIVITY":
             hold["notes"] = "LOW_ACTIVITY: No signal"
@@ -100,6 +116,38 @@ class SignalGenerator:
                 }
 
         # ------------------------------------------------------------------
+        # SETUP 1b: IMBALANCED MEAN-REVERSION (target 55-60% win rate)
+        # SD1 fade during trending markets with delta divergence
+        # Less reliable than balanced mean-reversion but more common
+        # ------------------------------------------------------------------
+        if market_state == "IMBALANCED_BULL":
+            if (vwap_position == "ABOVE_SD1"
+                    and delta_direction == "NEGATIVE"
+                    and delta_flip):
+                signal = {
+                    "action": "SELL",
+                    "setup_type": "MEAN_REVERSION_SHORT",
+                    "confidence": 0.58,
+                    "target": "VWAP",
+                    "stop": "SD2_UPPER",
+                    "rr_ratio": 1.8,
+                    "notes": "SD1 fade in bull trend, delta flipping negative",
+                }
+        elif market_state == "IMBALANCED_BEAR":
+            if (vwap_position == "BELOW_SD1"
+                  and delta_direction == "POSITIVE"
+                  and delta_flip):
+                signal = {
+                    "action": "BUY",
+                    "setup_type": "MEAN_REVERSION_LONG",
+                    "confidence": 0.58,
+                    "target": "VWAP",
+                    "stop": "SD2_LOWER",
+                    "rr_ratio": 1.8,
+                    "notes": "SD1 fade in bear trend, delta flipping positive",
+                }
+
+        # ------------------------------------------------------------------
         # SETUP 2: VWAP RECLAIM CONTINUATION (target 55-65% win rate)
         # Price holds above/below VWAP in imbalanced market + volume confirms
         # ------------------------------------------------------------------
@@ -132,30 +180,31 @@ class SignalGenerator:
                 }
 
         # ------------------------------------------------------------------
-        # SETUP 3: SD2 EXTREME FADE (target 55-60% win rate)
-        # Price hits SD2, volume climax, delta reversal → fade to SD1/VWAP
-        # (checked regardless of market_state — SD2 extremes override regime)
+        # SETUP 3: SD2 EXTREME FADE - DISABLED
+        # Backtest showed 0% win rate on MES data over 60 days
+        # Keeping code commented for reference, but do not use until
+        # video data can validate this edge
         # ------------------------------------------------------------------
-        if vwap_position == "ABOVE_SD2" and volume_spike and delta_direction == "NEGATIVE":
-            signal = {
-                "action": "SELL",
-                "setup_type": "SD2_EXTREME_FADE_SHORT",
-                "confidence": 0.58,
-                "target": "SD1_UPPER",
-                "stop": "SD2_UPPER_PLUS_BUFFER",
-                "rr_ratio": 2.5,
-                "notes": "SD2 extreme extension, volume climax, negative delta",
-            }
-        elif vwap_position == "BELOW_SD2" and volume_spike and delta_direction == "POSITIVE":
-            signal = {
-                "action": "BUY",
-                "setup_type": "SD2_EXTREME_FADE_LONG",
-                "confidence": 0.58,
-                "target": "SD1_LOWER",
-                "stop": "SD2_LOWER_MINUS_BUFFER",
-                "rr_ratio": 2.5,
-                "notes": "SD2 extreme extension, volume climax, positive delta",
-            }
+        # if vwap_position == "ABOVE_SD2" and delta_direction == "NEGATIVE":
+        #     signal = {
+        #         "action": "SELL",
+        #         "setup_type": "SD2_EXTREME_FADE_SHORT",
+        #         "confidence": 0.55,
+        #         "target": "VWAP",
+        #         "stop": "SD2_UPPER",
+        #         "rr_ratio": 2.0,
+        #         "notes": "SD2 extreme extension, negative delta",
+        #     }
+        # elif vwap_position == "BELOW_SD2" and delta_direction == "POSITIVE":
+        #     signal = {
+        #         "action": "BUY",
+        #         "setup_type": "SD2_EXTREME_FADE_LONG",
+        #         "confidence": 0.55,
+        #         "target": "VWAP",
+        #         "stop": "SD2_LOWER",
+        #         "rr_ratio": 2.0,
+        #         "notes": "SD2 extreme extension, positive delta",
+        #     }
 
         return signal
 
