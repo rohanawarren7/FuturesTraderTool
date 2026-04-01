@@ -1,7 +1,54 @@
-PROP_FIRM_CONFIGS = {
+def _topstep_live_risk_expansion(default_dll: int) -> list[dict]:
+    """
+    Current Topstep Live Funded tiers derived from public help-centre guidance.
 
+    The model is intentionally conservative. It captures the live funded daily
+    loss limit progression and active-day gating without trying to simulate
+    every operational detail of Topstep's reserve accounting.
+    """
+    return [
+        {
+            "name": "base",
+            "min_net_profit": 0,
+            "max_position_size": 5,
+            "daily_loss_limit": default_dll,
+            "active_days_required": 0,
+        },
+        {
+            "name": "profit_15k",
+            "min_net_profit": 15_000,
+            "max_position_size": 10,
+            "daily_loss_limit": max(default_dll, 2_500 if default_dll == 2_000 else default_dll + 500),
+            "active_days_required": 10,
+        },
+        {
+            "name": "profit_20k",
+            "min_net_profit": 20_000,
+            "max_position_size": 12,
+            "daily_loss_limit": max(default_dll, 3_000 if default_dll == 2_000 else default_dll + 1_000),
+            "active_days_required": 10,
+        },
+        {
+            "name": "profit_50k",
+            "min_net_profit": 50_000,
+            "max_position_size": 20,
+            "daily_loss_limit": max(default_dll, 3_500 if default_dll == 2_000 else default_dll + 1_500),
+            "active_days_required": 10,
+        },
+        {
+            "name": "profit_100k",
+            "min_net_profit": 100_000,
+            "max_position_size": 30,
+            "daily_loss_limit": 10_000,
+            "active_days_required": 10,
+        },
+    ]
+
+
+PROP_FIRM_CONFIGS = {
     "TOPSTEP_50K": {
         "firm": "Topstep",
+        "program_stage": "LIVE_FUNDED",
         "account_size": 50_000,
         "monthly_cost_usd": 49,
         "profit_target": 3_000,
@@ -9,23 +56,30 @@ PROP_FIRM_CONFIGS = {
         "trailing_type": "EOD",
         "trailing_stops_at_profit": None,
         "max_contracts": 5,
-        "daily_loss_limit": None,
+        "daily_loss_limit": 2_000,
         "profit_split": 0.90,
         "first_withdrawal_bonus": 10_000,
         "min_payout_days": 5,
         "min_winning_day_pnl": 200,
         "max_payout_per_request": 5_000,
         "payout_max_pct": 0.50,
+        "starting_balance_floor": 10_000,
+        "starting_balance_pct_of_combined": 0.20,
+        "reserve_unlock_structure": [0.25, 0.25, 0.25, 0.25],
+        "risk_expansion_model": "dynamic_live_risk_expansion",
+        "live_risk_expansion_tiers": _topstep_live_risk_expansion(2_000),
+        "risk_expansion_active_days_required": 10,
+        "allowed_trading_days_count_method": "micro_trade_counts_as_active_day",
         "instruments": ["MES", "MNQ", "ES", "NQ", "CL", "GC"],
         "exchange": "CME/CBOT/NYMEX/COMEX",
         "news_trading_allowed": True,
         "activation_fee": 0,
-        "notes": "MLL trails EOD high-water mark. No daily loss limit since Aug 2024.",
-        "config_version": "2024-08",
+        "notes": "Topstep Live Funded default DLL is $2,000 with dynamic risk expansion after required active days at each profit tier.",
+        "config_version": "2026-02-19",
     },
-
     "TOPSTEP_100K": {
         "firm": "Topstep",
+        "program_stage": "LIVE_FUNDED",
         "account_size": 100_000,
         "monthly_cost_usd": 99,
         "profit_target": 6_000,
@@ -33,22 +87,30 @@ PROP_FIRM_CONFIGS = {
         "trailing_type": "EOD",
         "trailing_stops_at_profit": None,
         "max_contracts": 10,
-        "daily_loss_limit": None,
+        "daily_loss_limit": 3_000,
         "profit_split": 0.90,
         "first_withdrawal_bonus": 10_000,
         "min_payout_days": 5,
         "min_winning_day_pnl": 200,
         "max_payout_per_request": 5_000,
         "payout_max_pct": 0.50,
+        "starting_balance_floor": 10_000,
+        "starting_balance_pct_of_combined": 0.20,
+        "reserve_unlock_structure": [0.25, 0.25, 0.25, 0.25],
+        "risk_expansion_model": "dynamic_live_risk_expansion",
+        "live_risk_expansion_tiers": _topstep_live_risk_expansion(3_000),
+        "risk_expansion_active_days_required": 10,
+        "allowed_trading_days_count_method": "micro_trade_counts_as_active_day",
         "instruments": ["MES", "MNQ", "ES", "NQ", "CL", "GC"],
         "exchange": "CME/CBOT/NYMEX/COMEX",
         "news_trading_allowed": True,
         "activation_fee": 0,
-        "config_version": "2024-08",
+        "notes": "Topstep Live Funded default DLL is $3,000 with dynamic risk expansion after required active days at each profit tier.",
+        "config_version": "2026-02-19",
     },
-
     "TOPSTEP_150K": {
         "firm": "Topstep",
+        "program_stage": "LIVE_FUNDED",
         "account_size": 150_000,
         "monthly_cost_usd": 149,
         "profit_target": 9_000,
@@ -56,22 +118,30 @@ PROP_FIRM_CONFIGS = {
         "trailing_type": "EOD",
         "trailing_stops_at_profit": None,
         "max_contracts": 15,
-        "daily_loss_limit": None,
+        "daily_loss_limit": 4_500,
         "profit_split": 0.90,
         "first_withdrawal_bonus": 10_000,
         "min_payout_days": 5,
         "min_winning_day_pnl": 200,
         "max_payout_per_request": 5_000,
         "payout_max_pct": 0.50,
+        "starting_balance_floor": 10_000,
+        "starting_balance_pct_of_combined": 0.20,
+        "reserve_unlock_structure": [0.25, 0.25, 0.25, 0.25],
+        "risk_expansion_model": "dynamic_live_risk_expansion",
+        "live_risk_expansion_tiers": _topstep_live_risk_expansion(4_500),
+        "risk_expansion_active_days_required": 10,
+        "allowed_trading_days_count_method": "micro_trade_counts_as_active_day",
         "instruments": ["MES", "MNQ", "ES", "NQ", "CL", "GC"],
         "exchange": "CME/CBOT/NYMEX/COMEX",
         "news_trading_allowed": True,
         "activation_fee": 0,
-        "config_version": "2024-08",
+        "notes": "Topstep Live Funded default DLL is $4,500 with dynamic risk expansion after required active days at each profit tier.",
+        "config_version": "2026-02-19",
     },
-
     "APEX_50K": {
         "firm": "Apex Trader Funding",
+        "program_stage": "FUNDED",
         "account_size": 50_000,
         "monthly_cost_usd": 167,
         "profit_target": 3_000,
@@ -90,9 +160,9 @@ PROP_FIRM_CONFIGS = {
         "activation_fee": 85,
         "config_version": "2024-08",
     },
-
     "APEX_100K": {
         "firm": "Apex Trader Funding",
+        "program_stage": "FUNDED",
         "account_size": 100_000,
         "monthly_cost_usd": 207,
         "profit_target": 6_000,
@@ -110,16 +180,16 @@ PROP_FIRM_CONFIGS = {
         "activation_fee": 85,
         "config_version": "2024-08",
     },
-
     "FTMO_100K": {
         "firm": "FTMO",
+        "program_stage": "FUNDED",
         "account_size": 100_000,
         "monthly_cost_usd": 0,
         "challenge_fee_eur": 540,
-        "profit_target": 10_000,       # 10% of account
+        "profit_target": 10_000,
         "profit_target_pct": 0.10,
         "verification_target_pct": 0.05,
-        "max_loss_limit": 10_000,      # 10% of account
+        "max_loss_limit": 10_000,
         "max_loss_pct": 0.10,
         "max_daily_loss_pct": 0.05,
         "trailing_type": "EOD",

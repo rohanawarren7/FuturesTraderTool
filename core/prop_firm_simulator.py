@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from typing import Optional
 import sys
 import os
@@ -9,15 +10,13 @@ from config.prop_firm_configs import PROP_FIRM_CONFIGS
 
 class PropFirmSimulator:
     """
-    Simulates funded account constraints during backtesting.
-    Wraps a backtest engine and enforces all prop firm rules in real time.
-    Must be called on every bar and every trade execution.
+    Simulates funded-account constraints during backtesting and live risk review.
 
-    Bug fixes vs original spec:
-      - Bug 1: self.opening_balance_today tracks the day's opening balance correctly.
-               close_day() sets this on each new day so daily_pnl is always accurate.
-      - Bug 2: self.intraday_daily_pnl is updated on every tick via update_intraday()
-               so the Apex consistency rule fires in real time, not just at EOD.
+    Key improvements:
+    - honours Topstep Live Funded daily loss limits
+    - exposes dynamic live risk expansion tiers
+    - distinguishes internal bot hard stops from firm-level hard stops
+    - keeps opening balance and intraday daily PnL accurate across sessions
     """
 
     def __init__(self, config: dict):
@@ -26,47 +25,33 @@ class PropFirmSimulator:
         self.balance = config["account_size"]
         self.equity = config["account_size"]
 
-        # High-water marks
         self.peak_eod_balance = config["account_size"]
         self.peak_intraday_equity = config["account_size"]
-
-        # --- Bug 1 fix: track opening balance per day ---
         self.opening_balance_today: float = config["account_size"]
-        self.current_day: Optional[str] = None  # set in close_day()
+        self.current_day: Optional[str] = None
 
-        # PnL tracking
-        self.daily_pnl: float = 0.0           # EOD-settled
-        self.intraday_daily_pnl: float = 0.0  # Bug 2 fix: live intraday figure
+        self.daily_pnl: float = 0.0
+        self.intraday_daily_pnl: float = 0.0
         self.total_pnl: float = 0.0
         self.lifetime_withdrawals: float = 0.0
 
-        # Logs
         self.trade_log: list = []
         self.daily_log: dict = {}
+        self.active_days: int = 0
 
-        # Payout tracking
         self.winning_days_since_last_payout: int = 0
         self.winning_day_pnl_threshold: float = config.get("min_winning_day_pnl", 200)
 
-        # Status
         self.account_blown: bool = False
         self.combine_passed: bool = False
-        self.status: str = "COMBINE"   # COMBINE → FUNDED → BLOWN → PASSED
+        self.status: str = "COMBINE"
         self.breach_reason: Optional[str] = None
-
-    # ------------------------------------------------------------------
-    # CORE RULE CHECKERS
-    # ------------------------------------------------------------------
 
     def get_mll_floor(self) -> float:
         """
-        Returns the current Maximum Loss Limit floor (the equity level that,
-        if touched, blows the account).
+        Returns the current maximum loss limit floor.
 
-        Topstep (EOD trailing): floor = peak_eod_balance - max_loss_limit
-        Apex (INTRADAY trailing): floor = peak_intraday_equity - max_loss_limit
-            — but stops trailing once profit >= trailing_stops_at_profit
-        FTMO (EOD, balance-based): floor = max(account_size, peak_eod) - max_loss_amount
+        Topstep uses an end-of-day trailing drawdown model in this simulator.
         """
         mll = self.config["max_loss_limit"]
         trailing_type = self.config.get("trailing_type", "EOD")
@@ -79,27 +64,52 @@ class PropFirmSimulator:
         if trailing_type == "INTRADAY":
             stops_at = self.config.get("trailing_stops_at_profit")
             if stops_at and (self.balance - self.account_size) >= stops_at:
-                # Apex: drawdown locks once profit exceeds threshold
                 return self.account_size - mll
             return self.peak_intraday_equity - mll
 
-        # EOD (Topstep default)
         return self.peak_eod_balance - mll
 
+    def get_daily_loss_limit(self) -> Optional[float]:
+        """Return the firm-level daily loss limit if one exists."""
+        return self._get_active_risk_tier().get("daily_loss_limit", self.config.get("daily_loss_limit"))
+
     def get_daily_loss_limit_floor(self) -> float:
-        """
-        Returns the absolute equity floor from the daily loss limit rule.
-        Only applies to FTMO ($5,000/day). Topstep has no daily loss limit.
-        """
-        if self.config.get("daily_loss_limit"):
-            return self.opening_balance_today - self.config["daily_loss_limit"]
+        """Returns the absolute equity floor implied by the daily loss limit."""
+        daily_loss_limit = self.get_daily_loss_limit()
+        if daily_loss_limit:
+            return self.opening_balance_today - daily_loss_limit
         return -float("inf")
 
+    def _get_active_risk_tier(self) -> dict:
+        tiers = sorted(
+            self.config.get("live_risk_expansion_tiers", []),
+            key=lambda item: item.get("min_net_profit", 0),
+        )
+        if not tiers:
+            return {
+                "name": "default",
+                "min_net_profit": 0,
+                "max_position_size": self.config.get("max_contracts"),
+                "daily_loss_limit": self.config.get("daily_loss_limit"),
+                "active_days_required": 0,
+            }
+
+        eligible = tiers[0]
+        for tier in tiers:
+            if self.total_pnl >= tier.get("min_net_profit", 0):
+                required_days = tier.get(
+                    "active_days_required",
+                    self.config.get("risk_expansion_active_days_required", 0),
+                )
+                if self.active_days >= required_days:
+                    eligible = tier
+        return eligible
+
+    def get_current_contract_limit(self) -> Optional[int]:
+        tier = self._get_active_risk_tier()
+        return tier.get("max_position_size", self.config.get("max_contracts"))
+
     def check_breach(self) -> tuple[bool, str]:
-        """
-        Checks all breach conditions. Returns (is_breached, reason).
-        Call this on every tick/bar update via update_intraday().
-        """
         mll_floor = self.get_mll_floor()
         daily_floor = self.get_daily_loss_limit_floor()
 
@@ -112,8 +122,6 @@ class PropFirmSimulator:
                 f"< Daily Floor {daily_floor:.2f}"
             )
 
-        # Bug 2 fix: Apex consistency rule uses intraday_daily_pnl (live),
-        # not self.daily_pnl (only updated at EOD).
         if self.config.get("consistency_rule") and self.total_pnl > 0:
             if self.intraday_daily_pnl > (self.total_pnl * 0.30):
                 return True, (
@@ -124,21 +132,15 @@ class PropFirmSimulator:
         return False, ""
 
     def check_contract_limit(self, requested_contracts: int) -> int:
-        """Caps contract size to the prop firm's maximum. Returns allowed contracts."""
-        max_c = self.config.get("max_contracts")
-        if max_c is None:
+        max_contracts = self.get_current_contract_limit()
+        if max_contracts is None:
             return requested_contracts
-        return min(requested_contracts, max_c)
+        return min(requested_contracts, max_contracts)
 
     def check_combine_passed(self) -> bool:
-        """Returns True if the profit target has been reached."""
         return (self.balance - self.account_size) >= self.config["profit_target"]
 
     def check_payout_eligible(self) -> tuple[bool, float]:
-        """
-        Returns (is_eligible, max_payout_amount).
-        Topstep: requires 5 winning days >= $200 net each since last payout.
-        """
         min_days = self.config.get("min_payout_days")
         if min_days and self.winning_days_since_last_payout < min_days:
             return False, 0.0
@@ -153,11 +155,6 @@ class PropFirmSimulator:
         return True, max(0.0, payout)
 
     def request_payout(self) -> float:
-        """
-        Processes a payout. Applies 100% vs configured split depending on
-        lifetime withdrawals vs the first-withdrawal bonus threshold.
-        Returns net amount received by the trader.
-        """
         eligible, gross_amount = self.check_payout_eligible()
         if not eligible or gross_amount <= 0:
             return 0.0
@@ -166,7 +163,7 @@ class PropFirmSimulator:
         bonus_remaining = max(0.0, bonus_cap - self.lifetime_withdrawals)
 
         if gross_amount <= bonus_remaining:
-            net = gross_amount  # 100% during bonus window
+            net = gross_amount
         else:
             at_100 = bonus_remaining
             at_split = gross_amount - bonus_remaining
@@ -176,30 +173,18 @@ class PropFirmSimulator:
         self.lifetime_withdrawals += gross_amount
         self.winning_days_since_last_payout = 0
 
-        # Topstep: after payout, MLL resets to current (lower) balance
         if self.config["firm"] == "Topstep":
             self.peak_eod_balance = self.balance
             self.opening_balance_today = self.balance
 
         return net
 
-    # ------------------------------------------------------------------
-    # STATE UPDATERS
-    # ------------------------------------------------------------------
-
     def update_intraday(self, current_equity: float):
-        """
-        Call on every tick/bar with current equity (settled balance + open PnL).
-        Updates intraday high-water mark and checks for breach.
-        """
         self.equity = current_equity
-
-        # Bug 2 fix: keep intraday_daily_pnl live so consistency rule works
         self.intraday_daily_pnl = current_equity - self.opening_balance_today
 
-        if self.config.get("trailing_type") == "INTRADAY":
-            if current_equity > self.peak_intraday_equity:
-                self.peak_intraday_equity = current_equity
+        if self.config.get("trailing_type") == "INTRADAY" and current_equity > self.peak_intraday_equity:
+            self.peak_intraday_equity = current_equity
 
         if not self.account_blown:
             breached, reason = self.check_breach()
@@ -208,31 +193,20 @@ class PropFirmSimulator:
                 self.breach_reason = reason
                 self.status = "BLOWN"
 
-    def close_day(self, eod_balance: float, day_label: str = ""):
-        """
-        Call at end of each trading day (4:00 PM ET).
-        Settles the day: updates balance, resets intraday trackers,
-        updates EOD high-water mark, and checks combine pass.
-
-        Bug 1 fix: opening_balance_today is set correctly here so that
-        the next day's daily_pnl and daily_floor calculations are accurate.
-        """
-        # Settle daily PnL against today's opening balance (Bug 1 fix)
+    def close_day(self, eod_balance: float, day_label: str = "", traded_today: bool = True):
         self.daily_pnl = eod_balance - self.opening_balance_today
         self.balance = eod_balance
 
-        # Update EOD high-water mark (Topstep, FTMO)
+        if traded_today:
+            self.active_days += 1
+
         if eod_balance > self.peak_eod_balance:
             self.peak_eod_balance = eod_balance
 
-        # Reset intraday peak for next session
         self.peak_intraday_equity = eod_balance
-
-        # Bug 1 fix: roll opening balance forward to start of next day
         self.opening_balance_today = eod_balance
         self.intraday_daily_pnl = 0.0
 
-        # Track winning days for payout eligibility
         if self.daily_pnl >= self.winning_day_pnl_threshold:
             self.winning_days_since_last_payout += 1
 
@@ -243,10 +217,12 @@ class PropFirmSimulator:
             "eod_balance": eod_balance,
             "daily_pnl": self.daily_pnl,
             "mll_floor": self.get_mll_floor(),
+            "daily_loss_limit": self.get_daily_loss_limit(),
+            "active_risk_tier": self._get_active_risk_tier(),
             "winning_days_since_payout": self.winning_days_since_last_payout,
+            "active_days": self.active_days,
         }
 
-        # Check combine passed
         if not self.combine_passed and self.check_combine_passed():
             self.combine_passed = True
             self.status = "FUNDED"
@@ -259,12 +235,16 @@ class PropFirmSimulator:
         return self.config["max_loss_limit"] * 0.40
 
     def get_report(self) -> dict:
-        """Returns a summary dict for a backtest or live session."""
+        active_tier = self._get_active_risk_tier()
         return {
             "firm": self.config["firm"],
+            "program_stage": self.config.get("program_stage"),
             "account_size": self.account_size,
             "final_balance": self.balance,
             "total_pnl": self.total_pnl,
+            "daily_pnl": self.daily_pnl,
+            "daily_loss_limit": self.get_daily_loss_limit(),
+            "daily_loss_limit_floor": self.get_daily_loss_limit_floor(),
             "lifetime_withdrawals": self.lifetime_withdrawals,
             "combine_passed": self.combine_passed,
             "account_blown": self.account_blown,
@@ -273,4 +253,10 @@ class PropFirmSimulator:
             "peak_eod_balance": self.peak_eod_balance,
             "current_mll_floor": self.get_mll_floor(),
             "winning_days_since_payout": self.winning_days_since_last_payout,
+            "active_days": self.active_days,
+            "active_risk_tier": active_tier,
+            "current_contract_limit": self.get_current_contract_limit(),
         }
+
+
+__all__ = ["PropFirmSimulator", "PROP_FIRM_CONFIGS"]
