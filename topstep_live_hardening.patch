@@ -1,0 +1,28 @@
+diff --git a/config/bot_risk_params.py b/config/bot_risk_params.py
+index ed8f406..b486f48 100644
+--- a/config/bot_risk_params.py
++++ b/config/bot_risk_params.py
+@@ -1,6 +1,7 @@
+ BOT_RISK_PARAMS = {
+     # Daily circuit breakers
+     "daily_stop_loss_pct_of_mll": 0.40,   # Stop trading if daily loss hits 40% of MLL
++    "internal_daily_hard_stop_usd": 350,   # Internal bot stop, intentionally tighter than firm-level DLL
+     "daily_profit_target_usd": 600,        # Optional: stop trading after $600 profit day
+     "profit_protect_threshold_usd": 400,   # Reduce size by 50% once $400 up on the day
+
+@@ -50,6 +51,7 @@ BOT_RISK_PARAMS = {
+     # Drawdown monitoring
+     "drawdown_monitor_interval_seconds": 5,
+     "emergency_flatten_on_breach": True,
++    "topstep_live_mode": True,
+
+     # MLL proximity
+     "mll_proximity_pct": 0.10,            # Within 10% of MLL floor = halt trading
+@@ -59,6 +61,7 @@ BOT_RISK_PARAMS = {
+ COMBINE_RISK_PARAMS = {
+     **BOT_RISK_PARAMS,
+     "daily_stop_loss_pct_of_mll": 0.30,  # Extra conservative during combine
++    "internal_daily_hard_stop_usd": 250,
+     "daily_profit_target_usd": 300,
+     "profit_protect_threshold_usd": 200,
+     "default_contracts": 1,
